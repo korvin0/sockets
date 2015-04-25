@@ -11,109 +11,133 @@ ob_implicit_flush();
 $address = '127.0.0.1';
 $port = 10000;
 
-if (($sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP)) === false) {
-    echo "socket_create() failed: reason: " . socket_strerror(socket_last_error()) . "\n";
-}
+$sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1);
 socket_set_option($sock, SOL_SOCKET, SO_KEEPALIVE, 1);
-
 //echo socket_get_option($sock, SOL_SOCKET, SO_KEEPALIVE);exit;
+socket_bind($sock, $address, $port);
+socket_listen($sock);
+echo "listen socket $address:$port\n";
 
-if (socket_bind($sock, $address, $port) === false) {
-    echo "socket_bind() failed: reason: " . socket_strerror(socket_last_error($sock)) . "\n";
-}
+$keepAlive = 0;
 
-if (socket_listen($sock, 5) === false) {
-    echo "socket_listen() failed: reason: " . socket_strerror(socket_last_error($sock)) . "\n";
-}
+$clients = array($sock);
 
-do {
-    if (!isset($msgsock)) {
-      echo "socket_accept\r\n";
-      if (($msgsock = socket_accept($sock)) === false) {
-          echo "socket_accept() failed: reason: " . socket_strerror(socket_last_error($sock)) . "\n";
-          break;
-      }
+while (true) {
+    $read = $clients;
+    foreach ($read as $k=>$v) {
+       if (empty($v)) unset($read[$k]);
+    }
+    $write = NULL;
+    $except = NULL;
+    if (socket_select($read, $write, $except, 0) < 1) continue;
+
+    if (in_array($sock, $read)) {
+	$clients[] = socket_accept($sock);
+	echo "socket open #".(count($clients)-1)."-- ".countClients()." sockets currently opened\r\n";
+	$key = array_search($sock, $read);
+	unset($read[$key]);
     }
     
-    $conbuf = '';
-    $finish = false;
-    do {
+    foreach ($read as $msgsock)
+    {
         //socket_set_block($msgsock);
-        echo "socket_read\r\n";
-        if (false === ($buf = socket_read($msgsock, 2048, PHP_BINARY_READ))) {
-            echo "socket_read() failed: reason: " . socket_strerror(socket_last_error($msgsock)) . "\n";
-            break 2;
-        }
+	$k = array_search($msgsock, $clients);
+	echo "* Read socket #$k\n";
+        if (!isset($conbuf[$k])) $conbuf[$k] = '';
+
+        $buf = @socket_read($msgsock, 2048, PHP_BINARY_READ);
+
         if (empty($buf)) {
-          echo "empty buf\r\n";
-          //exit('a');
+	  closeSocket($k, 'empty buf');
+          continue;
         }
-        echo "received: $buf\r\n";
-        $conbuf .= $buf;
+
+        echo "Request: ".trim(preg_replace('`\n.+$`s', '', $buf))."\n";
+        $conbuf[$k] .= $buf;
         
-        if (preg_match('`^GET\s+(\S+)\s+HTTP`', $conbuf, $reqfile)) {
-          if (preg_match('`\r?\n\r?\n`', $conbuf)) {
-            $finish = true;
+        if (preg_match('`^GET\s+(\S+)\s+HTTP`', $conbuf[$k], $reqfile)) {
+          if (preg_match('`\r?\n\r?\n`', $conbuf[$k])) {
+            $finish[$k] = true;
           }
-        } elseif (preg_match('`^POST \s+(\S+)\s+HTTP`', $conbuf, $reqfile)) {
-          if (preg_match('`Content\-Length\: (\d+)`', $conbuf, $m)) {
+        } elseif (preg_match('`^POST \s+(\S+)\s+HTTP`', $conbuf[$k], $reqfile)) {
+          if (preg_match('`Content\-Length\: (\d+)`', $conbuf[$k], $m)) {
             $leng = $m[1];
-            preg_match('`\r?\n\r?\n(.+)`s', $conbuf, $m);
-            if (strlen(trim($m[1])) >= $leng) $finish = true;
-          } elseif (preg_match('`\r?\n\r?\n`', $conbuf)) {
-            $finish = true;
+            preg_match('`\r?\n\r?\n(.+)`s', $conbuf[$k], $m);
+            if (strlen(trim($m[1])) >= $leng) $finish[$k] = true;
+          } elseif (preg_match('`\r?\n\r?\n`', $conbuf[$k])) {
+            $finish[$k] = true;
           }
         }
         
-        if ($finish) {
-          if (empty($reqfile[1])) {
-          $aaa = "<h1>404 error</h1>";
-$talkback = "HTTP/1.1 404 Not Found
-Date: Wed, 11 Feb 2009 11:20:59 GMT
-Server: Apache
-X-Powered-By: PHP/5.2.4-2ubuntu5wm1
-Last-Modified: Wed, 11 Feb 2009 11:20:59 GMT
-Content-Language: ru
-Content-Type: text/html; charset=utf-8
-Connection: Keep-Alive
-Content-Length: ".strlen($aaa)."
-Connection: close
-
-$aaa";
+        if (!empty($finish[$k])) {
+	  if (empty($reqfile[1])) {
+	      $content = "<h1>404 error</h1>";
+	      $headers = array(
+		'HTTP/1.1 404 Not Found',
+		'Date: Wed, 11 Feb 2009 11:20:59 GMT',
+		'Server: Apache',
+		'X-Powered-By: PHP/5.2.4-2ubuntu5wm1',
+		'Last-Modified: Wed, 11 Feb 2009 11:20:59 GMT',
+		'Content-Language: ru',
+		'Content-Type: text/html; charset=utf-8',
+		'Connection: Keep-Alive',
+		'Content-Length: '.strlen($content),
+		'Connection: close'
+	      );
           } else {
-            if ($reqfile[1] == '/') {
-              $reqfile[1] = 'index.html';
-            }
-          $aaa = file_get_contents(preg_replace('`^/`', '', $reqfile[1]));
-          //$aaa = '<h1>korvin0</h1>';
-$talkback = "HTTP/1.1 200 OK
-Date: Wed, 11 Feb 2009 11:20:59 GMT
-Server: Apache
-X-Powered-By: PHP/5.2.4-2ubuntu5wm1
-Last-Modified: Wed, 11 Feb 2009 11:20:59 GMT
-Content-Length: ".strlen($aaa)."
-Connection: Keep-Alive
+            $file = $reqfile[1] == '/' ? 'index.html' : preg_replace('`^/`', '', $reqfile[1]);
+            $content = file_get_contents($file);
+	    $headers = array(
+		'HTTP/1.1 200 OK',
+		'Date: Wed, 11 Feb 2009 11:20:59 GMT',
+		'Server: Apache',
+		'X-Powered-By: PHP/5.2.4-2ubuntu5wm1',
+		'Last-Modified: Wed, 11 Feb 2009 11:20:59 GMT',
+		'Content-Length: '.strlen($content),
+		'Connection: Keep-Alive'
+	    );
+	    if (preg_match('`\.html$`', $file)) {
+                $headers[] = 'Content-Type: text/html; charset=utf-8';
+            } elseif (preg_match('`\.gif$`', $file)) {
+	        $headers[] = 'Content-Type: image/gif';
+	    }
+	  }
+ 
+          echo 'Response: ' . trim(preg_replace('`\n.+`s','',implode("\n", $headers))) . "\n";
+	  $res = implode("\n", $headers) . "\n\n" . $content;
+          socket_write($msgsock, $res, strlen($res));
+	  $finish[$k] = false;
+	  $conbuf[$k] = '';
 
-$aaa";
-          }
-
-
-          socket_write($msgsock, $talkback, strlen($talkback));
-          break;
-        }
+          if (!$keepAlive) {
+	     closeSocket($k);
+	  }
+	 
+        } // end finish
         
+    }
 
-        //socket_write($msgsock, $talkback, strlen($talkback));
-        
-        //break;
-        //$talkback = "PHP: You said '$buf'.\n";
-        //echo "$buf\n";
-    } while (true);
-
-
-    //socket_close($msgsock);unset($msgsock);
-    
-} while (true);
+   
+}
 
 socket_close($sock);
+
+function closeSocket($k, $reason='')
+{
+    global $clients;
+    socket_close($clients[$k]);
+    $clients[$k] = '';
+    echo "close socket #".$k." -- ".countClients()." sockets opened left. " . (!empty($reason) ? "Reason: ".$reason : "") . "\n";
+}
+function countClients()
+{
+    global $clients;
+    $res = 0;
+    foreach ($clients as $v)
+    {
+        if (!empty($v)) $res++;
+    }
+    return $res;
+}
 ?> 
